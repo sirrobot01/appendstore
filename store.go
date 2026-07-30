@@ -380,7 +380,7 @@ func (s *Store) GetMetadata(key string) (*Metadata, error) {
 		return nil, fmt.Errorf("key %s: %w", key, ErrKeyNotFound)
 	}
 
-	return &Metadata{Attributes: entry.Attributes}, nil
+	return &Metadata{Attributes: cloneAttributes(entry.Attributes)}, nil
 }
 
 // Delete removes a key

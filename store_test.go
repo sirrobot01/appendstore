@@ -208,6 +208,46 @@ func TestOpenRejectsUnsupportedLogVersions(t *testing.T) {
 	}
 }
 
+func TestReadsAcrossMapGrowthAndCompaction(t *testing.T) {
+	oldSlack := defaultMapSlack
+	defaultMapSlack = 4 << 10 // force a remap every few appends
+	t.Cleanup(func() { defaultMapSlack = oldSlack })
+
+	path := filepath.Join(t.TempDir(), "store.db")
+	store := openTestStore(t, path)
+	payload := bytes.Repeat([]byte("p"), 1024)
+	for i := 0; i < 64; i++ {
+		value := append([]byte(fmt.Sprintf("%03d-", i)), payload...)
+		if err := store.Put(fmt.Sprintf("key-%03d", i), value, nil); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+		got, err := store.Get(fmt.Sprintf("key-%03d", i))
+		if err != nil {
+			t.Fatalf("get %d after append: %v", i, err)
+		}
+		if !bytes.HasPrefix(got, []byte(fmt.Sprintf("%03d-", i))) {
+			t.Fatalf("value %d = %q", i, got[:4])
+		}
+	}
+	if err := store.Compact(); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	seen := 0
+	err := store.ForEach(func(key string, value []byte) error {
+		seen++
+		if !bytes.HasPrefix(value, []byte(key[len("key-"):]+"-")) {
+			return fmt.Errorf("key %s has value prefix %q", key, value[:4])
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("iterate after compaction: %v", err)
+	}
+	if seen != 64 {
+		t.Fatalf("iterated %d values, want 64", seen)
+	}
+}
+
 func TestStoreRecoversIncompleteTrailingRecord(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.db")
 	store := openTestStore(t, path)

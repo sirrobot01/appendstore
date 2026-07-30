@@ -59,14 +59,11 @@ func (idx *index) Put(key string, entry *indexEntry) {
 	idx.sortedDirty = true
 }
 
+// Get returns the stored entry itself, not a copy. Callers must treat the
+// entry and its Attributes as read-only; public APIs that hand attributes to
+// the application must clone them first.
 func (idx *index) Get(key string) *indexEntry {
-	entry := idx.entries[key]
-	if entry == nil {
-		return nil
-	}
-	copy := *entry
-	copy.Attributes = cloneAttributes(entry.Attributes)
-	return &copy
+	return idx.entries[key]
 }
 
 func (idx *index) Delete(key string) {

@@ -2,6 +2,7 @@ package appendstore
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -25,6 +26,10 @@ const (
 
 	v4FixedBodySize = 16                  // flags/reserved + keyLen + attributesLen + valueLen
 	v4MinimumLength = v4FixedBodySize + 4 // fixed body + checksum
+
+	// maxRetainedScratch caps reused encode/read buffers so one oversized
+	// record does not pin memory for the life of the store.
+	maxRetainedScratch = 1 << 20
 
 	compactionTempSuffix   = ".compact.tmp"
 	compactionReadySuffix  = ".compact.ready"
@@ -63,7 +68,25 @@ type appendLog struct {
 	file     *os.File
 	path     string
 	writePos int64
+
+	// appendBuf is the reusable record encode buffer. Append is serialized by
+	// mu, so no further synchronization is needed.
+	appendBuf []byte
+
+	// mapped is a read-only memory map of the log file, nil when mapping is
+	// unavailable. Append remaps only while the caller holds the store write
+	// lock, and readers access mapped under the store read lock, so the store
+	// lock orders every remap against every mapped read.
+	mapped      []byte
+	mapDisabled bool
+	mapSlack    int64
 }
+
+// defaultMapSlack is the address-space headroom mapped beyond the end of the
+// file. Mapped pages become readable as appends grow the file underneath the
+// mapping, so a fresh map is only needed once per defaultMapSlack bytes of
+// growth. It is a variable so tests can shrink it to exercise remapping.
+var defaultMapSlack = int64(64 << 20)
 
 func openAppendLog(path string) (*appendLog, error) {
 	if err := recoverCompactionArtifacts(path); err != nil {
@@ -84,7 +107,7 @@ func openAppendLogFile(path string) (*appendLog, error) {
 		_ = file.Close()
 		return nil, err
 	}
-	log := &appendLog{file: file, path: path}
+	log := &appendLog{file: file, path: path, mapSlack: defaultMapSlack}
 	if info.Size() == 0 {
 		if err := log.writeHeader(); err != nil {
 			_ = file.Close()
@@ -98,6 +121,7 @@ func openAppendLogFile(path string) (*appendLog, error) {
 		}
 		log.writePos = info.Size()
 	}
+	log.remap()
 	return log, nil
 }
 
@@ -183,12 +207,13 @@ func createAppendLogMode(path string, mode os.FileMode) (*appendLog, error) {
 	if err != nil {
 		return nil, err
 	}
-	log := &appendLog{file: file, path: path}
+	log := &appendLog{file: file, path: path, mapSlack: defaultMapSlack}
 	if err := log.writeHeader(); err != nil {
 		_ = file.Close()
 		return nil, err
 	}
 	log.writePos = logHeaderSize
+	log.remap()
 	return log, nil
 }
 
@@ -241,11 +266,22 @@ func (l *appendLog) Append(key string, value []byte, deleted bool, attributes ma
 		return 0, 0, 0, 0, fmt.Errorf("%w: encoded record is %d bytes", ErrValueTooLarge, recordLength)
 	}
 	totalSize := 4 + int(recordLength)
-	buf := make([]byte, totalSize)
+	buf := l.appendBuf
+	if cap(buf) < totalSize {
+		buf = make([]byte, totalSize)
+		if totalSize <= maxRetainedScratch {
+			l.appendBuf = buf
+		}
+	}
+	buf = buf[:totalSize]
 	binary.LittleEndian.PutUint32(buf[:4], uint32(recordLength))
+	// The buffer is reused, so the flag and reserved bytes must be written
+	// explicitly; every other byte is fully overwritten below.
+	buf[4] = 0
 	if deleted {
 		buf[4] = 1
 	}
+	buf[5], buf[6], buf[7] = 0, 0, 0
 	binary.LittleEndian.PutUint32(buf[8:12], uint32(len(keyBytes)))
 	binary.LittleEndian.PutUint32(buf[12:16], uint32(len(attributesBytes)))
 	binary.LittleEndian.PutUint32(buf[16:20], uint32(len(value)))
@@ -263,10 +299,56 @@ func (l *appendLog) Append(key string, value []byte, deleted bool, attributes ma
 		return 0, 0, 0, 0, err
 	}
 	l.writePos += int64(totalSize)
+	if l.writePos > int64(len(l.mapped)) {
+		l.remap()
+	}
 	return valueOffset, int32(len(value)), recordStart, int64(totalSize), nil
 }
 
+// remap re-establishes the read-only memory map so it covers writePos plus
+// mapSlack bytes of headroom. Callers hold the store write lock (or have
+// exclusive access during Open), which orders the swap against mapped reads.
+// On any failure mapping is disabled and reads fall back to file reads.
+func (l *appendLog) remap() {
+	if l.mapDisabled {
+		return
+	}
+	if l.mapped != nil {
+		_ = munmapFile(l.mapped)
+		l.mapped = nil
+	}
+	length := l.writePos + l.mapSlack
+	if length <= 0 || length > int64(int(^uint(0)>>1)) {
+		l.mapDisabled = true
+		return
+	}
+	mapped, err := mmapFile(l.file, length)
+	if err != nil {
+		l.mapDisabled = true
+		return
+	}
+	l.mapped = mapped
+}
+
+// mappedRecord returns the stored record bytes from the memory map when the
+// map covers them. The caller must hold the store lock; see the mapped field
+// comment for the synchronization contract.
+func (l *appendLog) mappedRecord(recordOffset, storedSize int64) ([]byte, bool) {
+	end := recordOffset + storedSize
+	if l.mapped == nil || recordOffset < logHeaderSize || end > l.writePos || end > int64(len(l.mapped)) {
+		return nil, false
+	}
+	return l.mapped[recordOffset:end], true
+}
+
+// emptyAttributes is the encoding of zero attributes. It is shared and must
+// only be copied from, never written to.
+var emptyAttributes = make([]byte, 4)
+
 func encodeAttributes(attributes map[string]string) ([]byte, error) {
+	if len(attributes) == 0 {
+		return emptyAttributes, nil
+	}
 	if len(attributes) > maxAttributeCount {
 		return nil, fmt.Errorf("%w: %d attributes (maximum %d)", ErrAttributesTooLarge, len(attributes), maxAttributeCount)
 	}
@@ -347,19 +429,83 @@ func decodeAttributes(buf []byte) (map[string]string, error) {
 	return attributes, nil
 }
 
-func (l *appendLog) ReadRecordAt(recordOffset, storedSize int64) ([]byte, error) {
-	value, _, err := l.readRecordAtInto(recordOffset, storedSize, nil)
-	return value, err
-}
+// recordScratchPool holds reusable buffers for file-based record reads.
+var recordScratchPool = sync.Pool{New: func() any { return new([]byte) }}
 
-func (l *appendLog) ReadRecordAtInto(recordOffset, storedSize int64, scratch []byte) ([]byte, []byte, error) {
-	return l.readRecordAtInto(recordOffset, storedSize, scratch)
-}
-
-func (l *appendLog) readRecordAtInto(recordOffset, storedSize int64, scratch []byte) ([]byte, []byte, error) {
+func checkStoredSize(storedSize int64) error {
 	if storedSize < 4+v4MinimumLength || storedSize > int64(int(^uint(0)>>1)) {
-		return nil, scratch, fmt.Errorf("%w: invalid stored record size %d", ErrCorruptedData, storedSize)
+		return fmt.Errorf("%w: invalid stored record size %d", ErrCorruptedData, storedSize)
 	}
+	return nil
+}
+
+// validateStoredRecord checks the framing, checksum, and field lengths of one
+// complete stored record and returns the bounds of its value.
+func validateStoredRecord(record []byte) (valueStart, valueLen int64, err error) {
+	recordLength := int64(binary.LittleEndian.Uint32(record[:4]))
+	if recordLength+4 != int64(len(record)) {
+		return 0, 0, fmt.Errorf("%w: record length mismatch", ErrCorruptedData)
+	}
+	wantChecksum := binary.LittleEndian.Uint32(record[len(record)-4:])
+	gotChecksum := crc32.Checksum(record[4:len(record)-4], checksumTable)
+	if gotChecksum != wantChecksum {
+		return 0, 0, fmt.Errorf("%w: checksum mismatch", ErrCorruptedData)
+	}
+	keyLen := int64(binary.LittleEndian.Uint32(record[8:12]))
+	attributesLen := int64(binary.LittleEndian.Uint32(record[12:16]))
+	valueLen = int64(binary.LittleEndian.Uint32(record[16:20]))
+	if int64(v4MinimumLength)+keyLen+attributesLen+valueLen != recordLength {
+		return 0, 0, fmt.Errorf("%w: invalid record field lengths", ErrCorruptedData)
+	}
+	return 20 + keyLen + attributesLen, valueLen, nil
+}
+
+// ReadRecordAt validates the stored record and returns a copy of its value
+// that the caller owns.
+func (l *appendLog) ReadRecordAt(recordOffset, storedSize int64) ([]byte, error) {
+	if err := checkStoredSize(storedSize); err != nil {
+		return nil, err
+	}
+	if record, ok := l.mappedRecord(recordOffset, storedSize); ok {
+		valueStart, valueLen, err := validateStoredRecord(record)
+		if err != nil {
+			return nil, err
+		}
+		return bytes.Clone(record[valueStart : valueStart+valueLen]), nil
+	}
+	scratchPtr := recordScratchPool.Get().(*[]byte)
+	value, scratch, err := l.readRecordFromFile(recordOffset, storedSize, *scratchPtr)
+	var owned []byte
+	if err == nil {
+		owned = bytes.Clone(value)
+	}
+	if cap(scratch) <= maxRetainedScratch {
+		*scratchPtr = scratch
+		recordScratchPool.Put(scratchPtr)
+	}
+	return owned, err
+}
+
+// ReadRecordAtInto reads a record value using scratch as reusable backing.
+// The returned value is only valid until scratch is next reused.
+func (l *appendLog) ReadRecordAtInto(recordOffset, storedSize int64, scratch []byte) ([]byte, []byte, error) {
+	if err := checkStoredSize(storedSize); err != nil {
+		return nil, scratch, err
+	}
+	if record, ok := l.mappedRecord(recordOffset, storedSize); ok {
+		valueStart, valueLen, err := validateStoredRecord(record)
+		if err != nil {
+			return nil, scratch, err
+		}
+		// Copy out of the mapping: callers may scribble on the returned value,
+		// and the read-only mapping must never be written.
+		scratch = append(scratch[:0], record[valueStart:valueStart+valueLen]...)
+		return scratch, scratch, nil
+	}
+	return l.readRecordFromFile(recordOffset, storedSize, scratch)
+}
+
+func (l *appendLog) readRecordFromFile(recordOffset, storedSize int64, scratch []byte) ([]byte, []byte, error) {
 	if cap(scratch) < int(storedSize) {
 		scratch = make([]byte, storedSize)
 	} else {
@@ -368,22 +514,10 @@ func (l *appendLog) readRecordAtInto(recordOffset, storedSize int64, scratch []b
 	if _, err := l.file.ReadAt(scratch, recordOffset); err != nil {
 		return nil, scratch, err
 	}
-	recordLength := int64(binary.LittleEndian.Uint32(scratch[:4]))
-	if recordLength+4 != storedSize {
-		return nil, scratch, fmt.Errorf("%w: record length mismatch", ErrCorruptedData)
+	valueStart, valueLen, err := validateStoredRecord(scratch)
+	if err != nil {
+		return nil, scratch, err
 	}
-	wantChecksum := binary.LittleEndian.Uint32(scratch[len(scratch)-4:])
-	gotChecksum := crc32.Checksum(scratch[4:len(scratch)-4], checksumTable)
-	if gotChecksum != wantChecksum {
-		return nil, scratch, fmt.Errorf("%w: checksum mismatch", ErrCorruptedData)
-	}
-	keyLen := int64(binary.LittleEndian.Uint32(scratch[8:12]))
-	attributesLen := int64(binary.LittleEndian.Uint32(scratch[12:16]))
-	valueLen := int64(binary.LittleEndian.Uint32(scratch[16:20]))
-	if int64(v4MinimumLength)+keyLen+attributesLen+valueLen != recordLength {
-		return nil, scratch, fmt.Errorf("%w: invalid record field lengths", ErrCorruptedData)
-	}
-	valueStart := int64(20) + keyLen + attributesLen
 	return scratch[valueStart : valueStart+valueLen], scratch, nil
 }
 
@@ -510,6 +644,10 @@ func (l *appendLog) Sync() error {
 func (l *appendLog) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.mapped != nil {
+		_ = munmapFile(l.mapped)
+		l.mapped = nil
+	}
 	return l.file.Close()
 }
 
