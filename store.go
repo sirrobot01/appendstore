@@ -5,6 +5,7 @@
 //   - Append-only log file for durability
 //   - In-memory primary index for O(1) key lookups
 //   - LRU cache for frequently accessed entries
+//   - Memory-mapped reads with a file-read fallback
 //   - Optional secondary indexes over application-defined attributes
 //   - Background compaction to reclaim deleted space
 //

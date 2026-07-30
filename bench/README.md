@@ -17,15 +17,29 @@ go test -bench . -benchmem ./bench
 
 ## Results
 
-Apple M1 Pro, macOS, Go 1.26.5, 2026-07-30.
+Apple M1 Pro, macOS, Go 1.26.5, 2026-07-31.
+
+### Time per operation
 
 | Benchmark | appendstore | bbolt | badger | goleveldb | pebble |
 |---|---|---|---|---|---|
-| Put 128 B, no fsync | 2.5 µs | 32.0 µs | 6.7 µs | 3.3 µs | **1.1 µs** |
-| Put 4 KiB, no fsync | **7.8 µs** | 59.1 µs | 11.4 µs | 27.9 µs | 41.5 µs |
-| Put 128 B, fsync per write | **4.0 ms** | 8.4 ms | 0.04 ms* | 4.1 ms | 4.1 ms |
-| Get, random over 100k keys | 1.6 µs | **1.3 µs** | 2.1 µs | 3.1 µs | 6.8 µs |
-| Get, hot 500-key working set | **0.27 µs** | 0.73 µs | 1.15 µs | 0.49 µs | 0.64 µs |
+| Put 128 B, no fsync | 2.5 µs | 30.5 µs | 8.6 µs | 3.7 µs | **1.1 µs** |
+| Put 4 KiB, no fsync | **6.5 µs** | 44.6 µs | 10.9 µs | 27.3 µs | 42.6 µs |
+| Put 128 B, fsync per write | **4.1 ms** | 9.1 ms | 0.04 ms* | 4.2 ms | 4.1 ms |
+| Get, random over 100k keys | **0.91 µs** | 1.29 µs | 1.94 µs | 2.94 µs | 6.85 µs |
+| Get, hot 500-key working set | **0.27 µs** | 0.73 µs | 1.05 µs | 0.48 µs | 0.62 µs |
+
+### Allocated memory per operation
+
+Bytes per operation, with allocation count in parentheses.
+
+| Benchmark | appendstore | bbolt | badger | goleveldb | pebble |
+|---|---|---|---|---|---|
+| Put 128 B, no fsync | 139 (3) | 59,764 (60) | 1,990 (41) | 169 (6) | **36 (2)** |
+| Put 4 KiB, no fsync | **143 (3)** | 93,964 (68) | 20,511 (52) | 419 (6) | 366 (2) |
+| Put 128 B, fsync per write | **158 (2)** | 31,414 (50) | 2,074 (41) | 225 (5) | 176 (1) |
+| Get, random over 100k keys | 1,138 (5) | 1,112 (12) | 2,269 (15) | 1,411 (17) | **616 (4)** |
+| Get, hot 500-key working set | **532 (2)** | 1,012 (10) | 2,002 (14) | 644 (6) | 549 (3) |
 
 \* Badger syncs its mmapped write-ahead log with `msync(MS_SYNC)`, which does
 not flush the drive cache on macOS. The other stores use `F_FULLFSYNC` through
@@ -37,5 +51,9 @@ Go's `File.Sync`. The Badger number is not comparable on this platform.
 - "No fsync" disables synchronous writes in each store.
 - The random-read benchmark preloads 100,000 keys with 512-byte values. The
   working set defeats appendstore's 1000-entry LRU cache, so the benchmark
-  measures the disk read path.
+  measures the uncached read path. appendstore serves uncached reads from a
+  read-only memory map of the log, with a file-read fallback.
 - The hot-read benchmark uses 500 keys, which fit in appendstore's cache.
+- Allocation numbers come from `-benchmem` and include the benchmark
+  harness's key formatting (about two allocations per operation), which is
+  identical for every store.
