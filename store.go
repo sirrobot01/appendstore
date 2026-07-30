@@ -105,7 +105,9 @@ type statsCounters struct {
 	Compactions atomic.Int64
 }
 
-// Stats is an instantaneous snapshot of operational counters.
+// Stats is an instantaneous snapshot of operational counters. Reads counts
+// every value returned by Get and ForEach, whether served from the cache or
+// from disk; CacheHits and CacheMisses partition the Get calls.
 type Stats struct {
 	Writes      int64
 	Reads       int64
@@ -169,17 +171,6 @@ func Open(path string, options Options) (*Store, error) {
 		_ = lock.release()
 		cancel()
 		return nil, fmt.Errorf("failed to recover from log: %w", err)
-	}
-
-	// An old header cannot accept v4 records. Migrate it atomically before the
-	// store is returned, including old logs whose live set is empty.
-	if s.log.version < logVersion {
-		if err := s.Compact(); err != nil {
-			_ = s.log.Close()
-			_ = lock.release()
-			cancel()
-			return nil, fmt.Errorf("migrate log from v%d to v%d: %w", s.log.version, logVersion, err)
-		}
 	}
 
 	// Start background tasks
@@ -348,6 +339,7 @@ func (s *Store) Get(key string) ([]byte, error) {
 	// Check cache first
 	if value, ok := s.cache.Get(key); ok {
 		s.stats.CacheHits.Add(1)
+		s.stats.Reads.Add(1)
 		return bytes.Clone(value), nil
 	}
 
@@ -604,12 +596,7 @@ func (s *Store) Compact() error {
 		}
 
 		// Read value from old log
-		var value []byte
-		if s.log.version >= 4 {
-			value, err = s.log.ReadRecordAt(entry.RecordOffset, entry.StoredSize)
-		} else {
-			value, err = s.log.ReadAt(entry.Offset, entry.Size)
-		}
+		value, err := s.log.ReadRecordAt(entry.RecordOffset, entry.StoredSize)
 		if err != nil {
 			_ = newLog.Close()
 			_ = os.Remove(newLogPath)

@@ -27,21 +27,18 @@ func newLRUCache(capacity int) *lruCache {
 	}
 }
 
-// Get retrieves an item from the cache
+// Get retrieves an item from the cache. It holds the write lock for the whole
+// call: the value field must not be read after the lock is released because a
+// concurrent Put on the same key mutates it in place.
 func (c *lruCache) Get(key string) ([]byte, bool) {
-	c.mu.RLock()
-	elem, ok := c.items[key]
-	c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
+	elem, ok := c.items[key]
 	if !ok {
 		return nil, false
 	}
-
-	// Move to front (most recently used)
-	c.mu.Lock()
 	c.order.MoveToFront(elem)
-	c.mu.Unlock()
-
 	return elem.Value.(*cacheItem).value, true
 }
 

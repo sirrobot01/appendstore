@@ -190,129 +190,22 @@ func TestV4ChecksumDetectsValueCorruption(t *testing.T) {
 	}
 }
 
-func TestLegacyLogsMigrateToV4(t *testing.T) {
-	for _, version := range []uint32{1, 2, 3} {
+func TestOpenRejectsUnsupportedLogVersions(t *testing.T) {
+	for _, version := range []uint32{1, 2, 3, logVersion + 1} {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "store.db")
-			writeLegacyLog(t, path, version, true)
-			store := openTestStore(t, path)
-			if store.log.version != logVersion {
-				t.Fatalf("open version = %d, want %d", store.log.version, logVersion)
+			header := make([]byte, logHeaderSize)
+			copy(header[:4], logMagic)
+			binary.LittleEndian.PutUint32(header[4:8], version)
+			if err := os.WriteFile(path, header, 0600); err != nil {
+				t.Fatalf("write v%d log: %v", version, err)
 			}
-			value, err := store.Get("legacy-key")
-			if err != nil {
-				t.Fatalf("get migrated value: %v", err)
-			}
-			if string(value) != "legacy-value" {
-				t.Fatalf("migrated value = %q", value)
-			}
-			meta, err := store.GetMetadata("legacy-key")
-			if err != nil {
-				t.Fatalf("get migrated metadata: %v", err)
-			}
-			if meta.Attribute("category") != "movies" || meta.Attribute("provider") != "provider-a" || meta.Attribute("total_size") != "1234" {
-				t.Fatalf("migrated metadata = %#v", meta.Attributes)
-			}
-			if version >= 3 {
-				if meta.Attribute("protocol") != "torrent" || meta.Attribute("bad") != "true" || meta.Attribute("added_on") != "456" {
-					t.Fatalf("v3 metadata = %#v", meta.Attributes)
-				}
-			} else if _, exists := meta.Attributes["protocol"]; exists {
-				t.Fatalf("v%d unexpectedly gained protocol metadata", version)
-			}
-			if got := store.KeysBy("category", "movies"); len(got) != 1 || got[0] != "legacy-key" {
-				t.Fatalf("migrated category index = %v", got)
-			}
-			header, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatalf("read migrated header: %v", err)
-			}
-			if got := binary.LittleEndian.Uint32(header[4:8]); got != logVersion {
-				t.Fatalf("disk version = %d, want %d", got, logVersion)
+			_, err := Open(path, Options{})
+			if !errors.Is(err, ErrUnsupportedVersion) {
+				t.Fatalf("open v%d error = %v, want ErrUnsupportedVersion", version, err)
 			}
 		})
 	}
-}
-
-func TestEmptyLegacyLogMigratesBeforeFirstWrite(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "store.db")
-	writeLegacyLog(t, path, 3, false)
-	store := openTestStore(t, path)
-	if err := store.Put("new", []byte("v4"), nil); err != nil {
-		t.Fatalf("put after empty migration: %v", err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-	reopened := openTestStore(t, path)
-	value, err := reopened.Get("new")
-	if err != nil || string(value) != "v4" {
-		t.Fatalf("get after reopen = %q, %v", value, err)
-	}
-}
-
-func TestRecoversLegacyInterruptedCompaction(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "store.db")
-	writeLegacyLog(t, path+legacyCompactionSuffix, 3, true)
-	store := openTestStore(t, path)
-	value, err := store.Get("legacy-key")
-	if err != nil || string(value) != "legacy-value" {
-		t.Fatalf("recovered legacy compact value = %q, %v", value, err)
-	}
-	if store.log.version != logVersion {
-		t.Fatalf("recovered version = %d, want %d", store.log.version, logVersion)
-	}
-	if _, err := os.Stat(path + legacyCompactionSuffix); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("legacy compact artifact remains: %v", err)
-	}
-}
-
-func writeLegacyLog(t *testing.T, path string, version uint32, withRecord bool) {
-	t.Helper()
-	var buf bytes.Buffer
-	header := make([]byte, logHeaderSize)
-	copy(header[:4], logMagic)
-	binary.LittleEndian.PutUint32(header[4:8], version)
-	buf.Write(header)
-	if withRecord {
-		writeLegacyU32(&buf, len("legacy-key"))
-		buf.WriteString("legacy-key")
-		writeLegacyU32(&buf, len("legacy-value"))
-		buf.WriteString("legacy-value")
-		flags := byte(0)
-		if version >= 3 {
-			flags = 2
-		}
-		buf.WriteByte(flags)
-		writeLegacyField(&buf, "movies")
-		writeLegacyField(&buf, "provider-a")
-		writeLegacyField(&buf, "ready")
-		writeLegacyField(&buf, "Example")
-		var number [8]byte
-		binary.LittleEndian.PutUint64(number[:], 1234)
-		buf.Write(number[:])
-		if version >= 3 {
-			writeLegacyField(&buf, "torrent")
-			binary.LittleEndian.PutUint64(number[:], 456)
-			buf.Write(number[:])
-		}
-	}
-	if err := os.WriteFile(path, buf.Bytes(), 0600); err != nil {
-		t.Fatalf("write v%d log: %v", version, err)
-	}
-}
-
-func writeLegacyU32(buf *bytes.Buffer, value int) {
-	var encoded [4]byte
-	binary.LittleEndian.PutUint32(encoded[:], uint32(value))
-	buf.Write(encoded[:])
-}
-
-func writeLegacyField(buf *bytes.Buffer, value string) {
-	var length [2]byte
-	binary.LittleEndian.PutUint16(length[:], uint16(len(value)))
-	buf.Write(length[:])
-	buf.WriteString(value)
 }
 
 func TestStoreRecoversIncompleteTrailingRecord(t *testing.T) {

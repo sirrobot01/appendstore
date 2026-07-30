@@ -12,7 +12,7 @@ engine.
 ## Install
 
 ```sh
-go get github.com/sirrobot01/appendstore@v0.1.0
+go get github.com/sirrobot01/appendstore
 ```
 
 ## Usage
@@ -74,8 +74,21 @@ data is synchronized to durable storage:
 
 On startup, appendstore rebuilds its indexes, discards an incomplete trailing
 record, and rejects checksum corruption. Compaction writes and synchronizes a
-replacement before atomically installing it. Existing version 1–3 Decypharr
-logs are migrated to the current version 4 format when opened.
+replacement before atomically installing it. Compaction blocks all reads and
+writes until the replacement is installed; the pause grows with the size of
+the live data.
+
+Only version 4 logs are supported. `Open` returns `ErrUnsupportedVersion` for
+version 1–3 logs; open them once with appendstore v0.1.x to migrate them.
+
+## Limits
+
+- All keys and index metadata stay in memory. The store is not suitable for
+  keyspaces that exceed available RAM.
+- Each value is encoded in one in-memory buffer on write and read. Very large
+  values increase memory use accordingly (hard limit: 2 GiB per value).
+- Secondary indexes support exact-match equality only; there are no range or
+  prefix queries.
 
 ## Status
 
