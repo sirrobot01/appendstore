@@ -30,3 +30,15 @@ jobs:
           go-version: stable
       - run: go test -race ./...
       - run: go vet ./...
+
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      # One iteration per benchmark: keeps the bench module compiling and
+      # running without producing meaningful (or slow) measurements in CI.
+      - run: go test -run xxx -bench . -benchtime 1x ./...
+        working-directory: bench
