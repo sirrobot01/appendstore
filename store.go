@@ -174,6 +174,17 @@ func Open(path string, options Options) (*Store, error) {
 		return nil, fmt.Errorf("failed to recover from log: %w", err)
 	}
 
+	// An old header cannot accept v4 records. Migrate it atomically before the
+	// store is returned, including old logs whose live set is empty.
+	if s.log.version < logVersion {
+		if err := s.Compact(); err != nil {
+			_ = s.log.Close()
+			_ = lock.release()
+			cancel()
+			return nil, fmt.Errorf("migrate log from v%d to v%d: %w", s.log.version, logVersion, err)
+		}
+	}
+
 	// Start background tasks
 	if options.SyncInterval > 0 {
 		s.startSyncTask()
@@ -597,7 +608,12 @@ func (s *Store) Compact() error {
 		}
 
 		// Read value from old log
-		value, err := s.log.ReadRecordAt(entry.RecordOffset, entry.StoredSize)
+		var value []byte
+		if s.log.version >= 4 {
+			value, err = s.log.ReadRecordAt(entry.RecordOffset, entry.StoredSize)
+		} else {
+			value, err = s.log.ReadAt(entry.Offset, entry.Size)
+		}
 		if err != nil {
 			_ = newLog.Close()
 			_ = os.Remove(newLogPath)

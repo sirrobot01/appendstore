@@ -78,8 +78,10 @@ replacement before atomically installing it. Compaction blocks all reads and
 writes until the replacement is installed; the pause grows with the size of
 the live data.
 
-Only version 4 logs are supported. `Open` returns `ErrUnsupportedVersion` for
-version 1–3 logs; open them once with appendstore v0.1.x to migrate them.
+New records are always written in the version 4 format. `Open` reads legacy
+version 1–3 logs and migrates them to version 4 in one atomic compaction
+before it returns. `Open` returns `ErrUnsupportedVersion` for logs newer than
+version 4.
 
 ## Limits
 

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 )
 
@@ -34,6 +35,16 @@ const (
 	compactionTempSuffix   = ".compact.tmp"
 	compactionReadySuffix  = ".compact.ready"
 	compactionBackupSuffix = ".compact.backup"
+	legacyCompactionSuffix = ".compact"
+
+	legacyCategoryAttribute  = "category"
+	legacyProviderAttribute  = "provider"
+	legacyStatusAttribute    = "status"
+	legacyNameAttribute      = "name"
+	legacyTotalSizeAttribute = "total_size"
+	legacyProtocolAttribute  = "protocol"
+	legacyBadAttribute       = "bad"
+	legacyAddedOnAttribute   = "added_on"
 )
 
 // Version 4 record layout (all integers are little-endian):
@@ -68,6 +79,10 @@ type appendLog struct {
 	file     *os.File
 	path     string
 	writePos int64
+
+	// version is the on-disk log format. Logs older than logVersion are
+	// read-only: Open migrates them to v4 via Compact before serving writes.
+	version uint32
 
 	// appendBuf is the reusable record encode buffer. Append is serialized by
 	// mu, so no further synchronization is needed.
@@ -107,7 +122,7 @@ func openAppendLogFile(path string) (*appendLog, error) {
 		_ = file.Close()
 		return nil, err
 	}
-	log := &appendLog{file: file, path: path, mapSlack: defaultMapSlack}
+	log := &appendLog{file: file, path: path, mapSlack: defaultMapSlack, version: logVersion}
 	if info.Size() == 0 {
 		if err := log.writeHeader(); err != nil {
 			_ = file.Close()
@@ -115,10 +130,12 @@ func openAppendLogFile(path string) (*appendLog, error) {
 		}
 		log.writePos = logHeaderSize
 	} else {
-		if err := log.validateHeader(); err != nil {
+		version, err := log.validateHeader()
+		if err != nil {
 			_ = file.Close()
 			return nil, err
 		}
+		log.version = version
 		log.writePos = info.Size()
 	}
 	log.remap()
@@ -129,6 +146,7 @@ func recoverCompactionArtifacts(path string) error {
 	tempPath := path + compactionTempSuffix
 	readyPath := path + compactionReadySuffix
 	backupPath := path + compactionBackupSuffix
+	legacyPath := path + legacyCompactionSuffix
 
 	mainExists, err := fileExists(path)
 	if err != nil {
@@ -147,12 +165,20 @@ func recoverCompactionArtifacts(path string) error {
 		return err
 	}
 
+	legacyExists, err := fileExists(legacyPath)
+	if err != nil {
+		return err
+	}
+
 	switch {
 	case mainExists:
 		if err := removeIfExists(readyPath); err != nil {
 			return err
 		}
 		if err := removeIfExists(backupPath); err != nil {
+			return err
+		}
+		if err := removeIfExists(legacyPath); err != nil {
 			return err
 		}
 	case readyExists:
@@ -166,13 +192,20 @@ func recoverCompactionArtifacts(path string) error {
 		if err := os.Rename(backupPath, path); err != nil {
 			return fmt.Errorf("restore interrupted compaction: %w", err)
 		}
+	case legacyExists:
+		// Versions 1-3 used a single .compact file and removed the main log
+		// before renaming it. If the process died between those operations, the
+		// synced compact file is the only surviving database.
+		if err := os.Rename(legacyPath, path); err != nil {
+			return fmt.Errorf("restore legacy interrupted compaction: %w", err)
+		}
 	}
-	for _, artifact := range []string{tempPath, readyPath, backupPath} {
+	for _, artifact := range []string{tempPath, readyPath, backupPath, legacyPath} {
 		if err := removeIfExists(artifact); err != nil {
 			return err
 		}
 	}
-	if readyExists || backupExists || tempExists {
+	if readyExists || backupExists || tempExists || legacyExists {
 		if err := syncParentDirectory(path); err != nil {
 			return fmt.Errorf("sync directory after compaction recovery: %w", err)
 		}
@@ -207,7 +240,7 @@ func createAppendLogMode(path string, mode os.FileMode) (*appendLog, error) {
 	if err != nil {
 		return nil, err
 	}
-	log := &appendLog{file: file, path: path, mapSlack: defaultMapSlack}
+	log := &appendLog{file: file, path: path, mapSlack: defaultMapSlack, version: logVersion}
 	if err := log.writeHeader(); err != nil {
 		_ = file.Close()
 		return nil, err
@@ -225,31 +258,31 @@ func (l *appendLog) writeHeader() error {
 	return err
 }
 
-func (l *appendLog) validateHeader() error {
+func (l *appendLog) validateHeader() (uint32, error) {
 	header := make([]byte, logHeaderSize)
 	if _, err := l.file.ReadAt(header, 0); err != nil {
-		return fmt.Errorf("%w: read header: %v", ErrCorruptedData, err)
+		return 0, fmt.Errorf("%w: read header: %v", ErrCorruptedData, err)
 	}
 	if string(header[:4]) != logMagic {
-		return fmt.Errorf("%w: invalid magic", ErrCorruptedData)
+		return 0, fmt.Errorf("%w: invalid magic", ErrCorruptedData)
 	}
 	version := binary.LittleEndian.Uint32(header[4:8])
 	if version == 0 {
-		return fmt.Errorf("%w: invalid log version 0", ErrCorruptedData)
-	}
-	if version < logVersion {
-		return fmt.Errorf("%w: %d (use appendstore v0.1.x to migrate legacy logs)", ErrUnsupportedVersion, version)
+		return 0, fmt.Errorf("%w: invalid log version 0", ErrCorruptedData)
 	}
 	if version > logVersion {
-		return fmt.Errorf("%w: %d (maximum %d)", ErrUnsupportedVersion, version, logVersion)
+		return 0, fmt.Errorf("%w: %d (maximum %d)", ErrUnsupportedVersion, version, logVersion)
 	}
-	return nil
+	return version, nil
 }
 
 // Append writes one v4 record and returns the value and record locations.
 func (l *appendLog) Append(key string, value []byte, deleted bool, attributes map[string]string) (offset int64, size int32, recordOffset int64, storedSize int64, err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.version != logVersion {
+		return 0, 0, 0, 0, fmt.Errorf("cannot append v4 record to v%d log", l.version)
+	}
 	keyBytes := []byte(key)
 	if len(keyBytes) > maxKeySize {
 		return 0, 0, 0, 0, fmt.Errorf("%w: key is %d bytes (maximum %d)", ErrInvalidKey, len(keyBytes), maxKeySize)
@@ -460,6 +493,17 @@ func validateStoredRecord(record []byte) (valueStart, valueLen int64, err error)
 	return 20 + keyLen + attributesLen, valueLen, nil
 }
 
+// ReadAt reads a raw value by its offset and size. It is only used to read
+// values out of legacy (pre-v4) logs during migration; those records carry no
+// checksum, so no validation is possible.
+func (l *appendLog) ReadAt(offset int64, size int32) ([]byte, error) {
+	buf := make([]byte, size)
+	if _, err := l.file.ReadAt(buf, offset); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
 // ReadRecordAt validates the stored record and returns a copy of its value
 // that the caller owns.
 func (l *appendLog) ReadRecordAt(recordOffset, storedSize int64) ([]byte, error) {
@@ -535,7 +579,14 @@ func (l *appendLog) Iterate(fn func(*logRecord) error) error {
 	var attributesScratch []byte
 	valueCopyScratch := make([]byte, 32<<10)
 	for pos < fileSize {
-		record, nextPos, err := readV4RecordFrom(r, pos, fixed[:], &stringScratch, &attributesScratch, valueCopyScratch)
+		var record *logRecord
+		var nextPos int64
+		var err error
+		if l.version >= 4 {
+			record, nextPos, err = readV4RecordFrom(r, pos, fixed[:], &stringScratch, &attributesScratch, valueCopyScratch)
+		} else {
+			record, nextPos, err = readLegacyRecordFrom(r, pos, l.version, fixed[:8], &stringScratch)
+		}
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				if truncateErr := l.file.Truncate(pos); truncateErr != nil {
@@ -623,6 +674,123 @@ func readV4RecordFrom(r *bufio.Reader, startPos int64, fixed []byte, keyScratch,
 		Size:         int32(valueLen),
 		RecordOffset: startPos,
 		StoredSize:   int64(recordLength) + 4,
+		Deleted:      flags&1 != 0,
+		Attributes:   attributes,
+	}, pos, nil
+}
+
+func readLegacyRecordFrom(r *bufio.Reader, startPos int64, version uint32, fixed []byte, stringScratch *[]byte) (*logRecord, int64, error) {
+	pos := startPos
+	readU32 := func() (uint32, error) {
+		if _, err := io.ReadFull(r, fixed[:4]); err != nil {
+			return 0, err
+		}
+		pos += 4
+		return binary.LittleEndian.Uint32(fixed[:4]), nil
+	}
+	readU16 := func() (uint16, error) {
+		if _, err := io.ReadFull(r, fixed[:2]); err != nil {
+			return 0, err
+		}
+		pos += 2
+		return binary.LittleEndian.Uint16(fixed[:2]), nil
+	}
+	readU64 := func() (int64, error) {
+		if _, err := io.ReadFull(r, fixed[:8]); err != nil {
+			return 0, err
+		}
+		pos += 8
+		return int64(binary.LittleEndian.Uint64(fixed[:8])), nil
+	}
+	readString := func(length int) (string, error) {
+		buf := resizeScratch(stringScratch, length)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return "", err
+		}
+		pos += int64(length)
+		return string(buf), nil
+	}
+	keyLen, err := readU32()
+	if err != nil {
+		return nil, 0, err
+	}
+	if keyLen > maxKeySize {
+		return nil, 0, fmt.Errorf("invalid key length %d", keyLen)
+	}
+	key, err := readString(int(keyLen))
+	if err != nil {
+		return nil, 0, err
+	}
+	valueLen, err := readU32()
+	if err != nil {
+		return nil, 0, err
+	}
+	if int64(valueLen) > maxValueSize {
+		return nil, 0, fmt.Errorf("invalid value length %d", valueLen)
+	}
+	valueOffset := pos
+	if _, err := r.Discard(int(valueLen)); err != nil {
+		return nil, 0, err
+	}
+	pos += int64(valueLen)
+	if _, err := io.ReadFull(r, fixed[:1]); err != nil {
+		return nil, 0, err
+	}
+	pos++
+	flags := fixed[0]
+	readField := func() (string, error) {
+		length, err := readU16()
+		if err != nil {
+			return "", err
+		}
+		return readString(int(length))
+	}
+	category, err := readField()
+	if err != nil {
+		return nil, 0, err
+	}
+	provider, err := readField()
+	if err != nil {
+		return nil, 0, err
+	}
+	status, err := readField()
+	if err != nil {
+		return nil, 0, err
+	}
+	name, err := readField()
+	if err != nil {
+		return nil, 0, err
+	}
+	totalSize, err := readU64()
+	if err != nil {
+		return nil, 0, err
+	}
+	attributes := map[string]string{
+		legacyCategoryAttribute:  category,
+		legacyProviderAttribute:  provider,
+		legacyStatusAttribute:    status,
+		legacyNameAttribute:      name,
+		legacyTotalSizeAttribute: strconv.FormatInt(totalSize, 10),
+	}
+	if version >= 3 {
+		protocol, err := readField()
+		if err != nil {
+			return nil, 0, err
+		}
+		addedOn, err := readU64()
+		if err != nil {
+			return nil, 0, err
+		}
+		attributes[legacyProtocolAttribute] = protocol
+		attributes[legacyBadAttribute] = strconv.FormatBool(flags&2 != 0)
+		attributes[legacyAddedOnAttribute] = strconv.FormatInt(addedOn, 10)
+	}
+	return &logRecord{
+		Key:          key,
+		Offset:       valueOffset,
+		Size:         int32(valueLen),
+		RecordOffset: startPos,
+		StoredSize:   pos - startPos,
 		Deleted:      flags&1 != 0,
 		Attributes:   attributes,
 	}, pos, nil
