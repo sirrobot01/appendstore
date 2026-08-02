@@ -37,6 +37,15 @@ const (
 	compactionBackupSuffix = ".compact.backup"
 	legacyCompactionSuffix = ".compact"
 
+	// migrationBackupSuffix names the copy kept of a pre-migration log. Unlike
+	// the compaction artifacts above it is never reclaimed: it is the only way
+	// back to the format an older build can read.
+	migrationBackupSuffix = ".bak"
+	// migrationBackupTempSuffix is appended to the backup path, not the store
+	// path: the copy is renamed into place so a crash mid-copy cannot leave a
+	// truncated file that a later run trusts.
+	migrationBackupTempSuffix = ".tmp"
+
 	legacyCategoryAttribute  = "category"
 	legacyProviderAttribute  = "provider"
 	legacyStatusAttribute    = "status"

@@ -26,6 +26,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -69,6 +70,28 @@ type Options struct {
 	// OnError receives errors from background sync and compaction. It is never
 	// called while the store mutex is held.
 	OnError func(error)
+
+	// OnMigrate is called when Open finds a log in an older format, after the
+	// backup is taken and before the log is rewritten. Returning an error
+	// aborts Open and leaves the log in its original format. Optional.
+	OnMigrate func(MigrationInfo) error
+
+	// NoMigrationBackup skips the copy Open keeps of a pre-migration log.
+	// Migrating is one-way — a build that predates the new format refuses to
+	// read a migrated log — so only set this where the caller has its own way
+	// back, or where the disk cannot spare a second copy of the log.
+	NoMigrationBackup bool
+}
+
+// MigrationInfo describes a log about to be rewritten in the current format.
+type MigrationInfo struct {
+	// Path is the store path being migrated.
+	Path string
+	// FromVersion is the format found on disk; ToVersion is what replaces it.
+	FromVersion, ToVersion uint32
+	// Backup is the copy of the original log, or "" when NoMigrationBackup is
+	// set. Report it: it is what a downgrade restores.
+	Backup string
 }
 
 // Store is an append-only storage engine.
@@ -177,11 +200,11 @@ func Open(path string, options Options) (*Store, error) {
 	// An old header cannot accept v4 records. Migrate it atomically before the
 	// store is returned, including old logs whose live set is empty.
 	if s.log.version < logVersion {
-		if err := s.Compact(); err != nil {
+		if err := s.migrate(path); err != nil {
 			_ = s.log.Close()
 			_ = lock.release()
 			cancel()
-			return nil, fmt.Errorf("migrate log from v%d to v%d: %w", s.log.version, logVersion, err)
+			return nil, err
 		}
 	}
 
@@ -558,6 +581,73 @@ func (s *Store) NeedsCompaction() bool {
 
 	deadRatio := 1.0 - (float64(liveSize) / float64(dataSize))
 	return deadRatio > s.options.CompactionThreshold
+}
+
+// migrate rewrites an older log in the current format. A copy of the original
+// is kept first, because migrating is one-way: a build compiled against the
+// older format rejects the rewritten log outright, so without a copy the
+// upgrade cannot be undone. A backup that cannot be written fails the open —
+// migrating anyway is what leaves the caller with no way back.
+func (s *Store) migrate(path string) error {
+	info := MigrationInfo{Path: path, FromVersion: s.log.version, ToVersion: logVersion}
+	if !s.options.NoMigrationBackup {
+		info.Backup = fmt.Sprintf("%s.v%d%s", path, info.FromVersion, migrationBackupSuffix)
+		if err := copyLogFile(path, info.Backup); err != nil {
+			return fmt.Errorf("back up v%d log before migrating: %w", info.FromVersion, err)
+		}
+	}
+	if s.options.OnMigrate != nil {
+		if err := s.options.OnMigrate(info); err != nil {
+			return err
+		}
+	}
+	if err := s.Compact(); err != nil {
+		return fmt.Errorf("migrate log from v%d to v%d: %w", info.FromVersion, info.ToVersion, err)
+	}
+	return nil
+}
+
+// copyLogFile copies src to dst, leaving an existing dst untouched: a repeated
+// migration attempt must not replace the pristine copy. The copy lands under a
+// temporary name and is renamed, so an interrupted run cannot leave a truncated
+// file that a later attempt would mistake for a complete backup.
+func copyLogFile(src, dst string) error {
+	if _, err := os.Stat(dst); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	tmp := dst + migrationBackupTempSuffix
+	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return syncParentDirectory(dst)
 }
 
 // Compact removes deleted entries and rewrites the log

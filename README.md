@@ -83,6 +83,41 @@ version 1–3 logs and migrates them to version 4 in one atomic compaction
 before it returns. `Open` returns `ErrUnsupportedVersion` for logs newer than
 version 4.
 
+## Format migration
+
+Migration is one-way. A build compiled against the older format rejects a
+migrated log with `ErrUnsupportedVersion`, so an application that upgrades and
+then rolls back cannot read its own data.
+
+To keep a way back, `Open` copies the log to `<path>.v<version>.bak` before it
+migrates. A backup that cannot be written fails the open and leaves the log
+untouched. An existing backup is never replaced, so a repeated attempt cannot
+overwrite the original with partly migrated data. Backups are never reclaimed;
+delete them when the older release is no longer a target.
+
+Set `Options.OnMigrate` to observe the migration. It runs after the backup is
+taken and before the log is rewritten, and an error from it aborts the open:
+
+```go
+store, err := appendstore.Open(path, appendstore.Options{
+    OnMigrate: func(info appendstore.MigrationInfo) error {
+        log.Printf("upgrading %s from v%d to v%d; restore %s to roll back",
+            info.Path, info.FromVersion, info.ToVersion, info.Backup)
+        return nil
+    },
+})
+```
+
+Set `Options.NoMigrationBackup` to skip the copy. Use it only where the
+application has its own way back, or where the disk cannot hold a second copy
+of the log.
+
+To roll back, stop the application and restore each backup over its store:
+
+```bash
+mv store.db.v3.bak store.db
+```
+
 ## Limits
 
 - All keys and index metadata stay in memory. The store is not suitable for

@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -314,6 +315,192 @@ func writeLegacyLog(t *testing.T, path string, version uint32, withRecord bool) 
 	if err := os.WriteFile(path, buf.Bytes(), 0600); err != nil {
 		t.Fatalf("write v%d log: %v", version, err)
 	}
+}
+
+// A migrated log is unreadable to any build compiled against the old format,
+// so Open must leave the original behind before it rewrites anything.
+func TestMigrationKeepsRestorableBackup(t *testing.T) {
+	for _, version := range []uint32{1, 2, 3} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "store.db")
+			writeLegacyLog(t, path, version, true)
+			original, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read original: %v", err)
+			}
+
+			store := openTestStore(t, path)
+			if store.log.version != logVersion {
+				t.Fatalf("open version = %d, want %d", store.log.version, logVersion)
+			}
+
+			backup := fmt.Sprintf("%s.v%d%s", path, version, migrationBackupSuffix)
+			saved, err := os.ReadFile(backup)
+			if err != nil {
+				t.Fatalf("no pre-migration copy: %v", err)
+			}
+			if !bytes.Equal(saved, original) {
+				t.Fatal("backup does not match the pre-migration log")
+			}
+			// Restoring must produce something this build still migrates, which
+			// is what makes it a usable rollback rather than a stale artifact.
+			if got := binary.LittleEndian.Uint32(saved[4:8]); got != version {
+				t.Fatalf("backup version = %d, want %d", got, version)
+			}
+		})
+	}
+}
+
+func TestMigrationBackupSurvivesRepeatedAttempts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.db")
+	writeLegacyLog(t, path, 3, true)
+	backup := fmt.Sprintf("%s.v3%s", path, migrationBackupSuffix)
+
+	// A refused migration leaves the log legacy, so the next open retries. The
+	// second attempt must not overwrite the copy the first one took.
+	refused := errors.New("not now")
+	if _, err := Open(path, Options{OnMigrate: func(MigrationInfo) error { return refused }}); !errors.Is(err, refused) {
+		t.Fatalf("open error = %v, want %v", err, refused)
+	}
+	if got := logVersionOnDisk(t, path); got != 3 {
+		t.Fatalf("refused migration rewrote the log to v%d", got)
+	}
+	if err := os.WriteFile(backup, []byte("first backup"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	store := openTestStore(t, path)
+	if store.log.version != logVersion {
+		t.Fatalf("retry did not migrate: version = %d", store.log.version)
+	}
+	saved, err := os.ReadFile(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(saved) != "first backup" {
+		t.Fatalf("backup was replaced: %q", saved)
+	}
+}
+
+func TestMigrationReportsBackupToCaller(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.db")
+	writeLegacyLog(t, path, 3, true)
+
+	var got MigrationInfo
+	calls := 0
+	store, err := Open(path, Options{OnMigrate: func(info MigrationInfo) error {
+		calls++
+		got = info
+		// The backup must exist by the time the caller hears about it, and the
+		// log must still be untouched so a refusal is recoverable.
+		if _, statErr := os.Stat(info.Backup); statErr != nil {
+			t.Errorf("backup missing when OnMigrate ran: %v", statErr)
+		}
+		if v := logVersionOnDisk(t, info.Path); v != 3 {
+			t.Errorf("log already rewritten to v%d when OnMigrate ran", v)
+		}
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if calls != 1 {
+		t.Fatalf("OnMigrate called %d times, want 1", calls)
+	}
+	want := MigrationInfo{
+		Path:        path,
+		FromVersion: 3,
+		ToVersion:   logVersion,
+		Backup:      fmt.Sprintf("%s.v3%s", path, migrationBackupSuffix),
+	}
+	if got != want {
+		t.Fatalf("migration info = %#v, want %#v", got, want)
+	}
+}
+
+func TestNoMigrationBackupSkipsTheCopy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.db")
+	writeLegacyLog(t, path, 3, true)
+
+	var got MigrationInfo
+	store, err := Open(path, Options{
+		NoMigrationBackup: true,
+		OnMigrate:         func(info MigrationInfo) error { got = info; return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if got.Backup != "" {
+		t.Fatalf("backup path = %q, want empty", got.Backup)
+	}
+	if _, err := os.Stat(fmt.Sprintf("%s.v3%s", path, migrationBackupSuffix)); !os.IsNotExist(err) {
+		t.Fatalf("a backup was written anyway: %v", err)
+	}
+}
+
+// A store already in the current format has nothing to preserve.
+func TestCurrentFormatDoesNotMigrate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.db")
+	store, err := Open(path, Options{OnMigrate: func(MigrationInfo) error {
+		t.Error("OnMigrate ran for a store in the current format")
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put("key", []byte("value"), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := openTestStore(t, path)
+	if reopened.log.version != logVersion {
+		t.Fatalf("version = %d", reopened.log.version)
+	}
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), migrationBackupSuffix) {
+			t.Fatalf("unexpected backup %s", e.Name())
+		}
+	}
+}
+
+// The backup is the safety net, so a store that cannot write one must not
+// migrate: proceeding is exactly what leaves the caller stranded.
+func TestUnwritableBackupAbortsMigration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store.db")
+	writeLegacyLog(t, path, 3, true)
+
+	// A directory in the backup's place cannot be opened as a file.
+	if err := os.Mkdir(fmt.Sprintf("%s.v3%s.tmp", path, migrationBackupSuffix), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Open(path, Options{}); err == nil {
+		t.Fatal("open succeeded despite an unwritable backup")
+	}
+	if got := logVersionOnDisk(t, path); got != 3 {
+		t.Fatalf("log was migrated to v%d despite the failed backup", got)
+	}
+}
+
+func logVersionOnDisk(t *testing.T, path string) uint32 {
+	t.Helper()
+	header, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read header: %v", err)
+	}
+	return binary.LittleEndian.Uint32(header[4:8])
 }
 
 func writeLegacyU32(buf *bytes.Buffer, value int) {
