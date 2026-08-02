@@ -16,6 +16,7 @@ func FuzzReadRecordFrom(f *testing.F) {
 		var fixed [16]byte
 		var key []byte
 		var attributes []byte
-		_, _, _ = readV4RecordFrom(reader, logHeaderSize, fixed[:], &key, &attributes, make([]byte, 32<<10))
+		var extensions []byte
+		_, _, _ = readRecordFrom(reader, logHeaderSize, fixed[:], &key, &attributes, &extensions, make([]byte, 32<<10))
 	})
 }

@@ -164,7 +164,7 @@ func TestGenericSecondaryIndexesTrackUpdates(t *testing.T) {
 	}
 }
 
-func TestV4ChecksumDetectsValueCorruption(t *testing.T) {
+func TestChecksumDetectsValueCorruption(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.db")
 	store := openTestStore(t, path)
 	if err := store.Put("key", []byte("checksum-value"), nil); err != nil {
@@ -205,7 +205,7 @@ func TestOpenRejectsUnsupportedLogVersions(t *testing.T) {
 	}
 }
 
-func TestLegacyLogsMigrateToV4(t *testing.T) {
+func TestLegacyLogsMigrateToCurrentFormat(t *testing.T) {
 	for _, version := range []uint32{1, 2, 3} {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "store.db")
@@ -598,7 +598,7 @@ func TestStoreRecoversIncompleteTrailingRecord(t *testing.T) {
 	}
 }
 
-func TestStoreRecoversPartiallyWrittenV4Record(t *testing.T) {
+func TestStoreRecoversPartiallyWrittenRecord(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "store.db")
 	store := openTestStore(t, path)
@@ -754,7 +754,7 @@ func TestStoreCompletesInterruptedCompaction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create ready log: %v", err)
 	}
-	if _, _, _, _, err := ready.Append("version", []byte("new"), false, nil); err != nil {
+	if _, _, _, _, err := ready.Append("version", []byte("new"), false, nil, nil); err != nil {
 		t.Fatalf("append ready value: %v", err)
 	}
 	if err := ready.Sync(); err != nil {

@@ -39,6 +39,8 @@ var (
 	ErrStoreLocked          = errors.New("store is already open by another process")
 	ErrCorruptedData        = errors.New("corrupted data detected")
 	ErrUnsupportedVersion   = errors.New("unsupported log version")
+	ErrUnsupportedFeature   = errors.New("unsupported log feature")
+	ErrReadOnly             = errors.New("store is read-only")
 	ErrCompactionInProgress = errors.New("compaction already in progress")
 	ErrKeyNotFound          = errors.New("key not found")
 	ErrInvalidKey           = errors.New("invalid key")
@@ -110,6 +112,11 @@ type Store struct {
 	// State
 	closed     atomic.Bool
 	compacting atomic.Bool
+
+	// readOnlyReason is the error every write returns when the log sets a
+	// read-only feature bit this build does not know. It is set once, in Open,
+	// before the store is handed to the caller, so it needs no lock.
+	readOnlyReason error
 
 	// Background tasks
 	ctx    context.Context
@@ -186,6 +193,13 @@ func Open(path string, options Options) (*Store, error) {
 		return nil, fmt.Errorf("failed to open append log: %w", err)
 	}
 
+	// A read-only feature bit this build does not know means the log is still
+	// readable, but a write from here would leave whatever the bit describes
+	// stale. Serve reads and refuse every write.
+	if unknown := s.log.unknownReadOnly(); unknown != 0 {
+		s.readOnlyReason = fmt.Errorf("%w: %w", ErrReadOnly, unknownFeatureError("read-only", unknown))
+	}
+
 	s.index = newIndex(options.IndexedFields)
 	s.cache = newLRUCache(options.CacheSize)
 
@@ -197,8 +211,8 @@ func Open(path string, options Options) (*Store, error) {
 		return nil, fmt.Errorf("failed to recover from log: %w", err)
 	}
 
-	// An old header cannot accept v4 records. Migrate it atomically before the
-	// store is returned, including old logs whose live set is empty.
+	// An old header cannot accept a current record. Migrate it before the store
+	// is returned, including old logs whose live set is empty.
 	if s.log.version < logVersion {
 		if err := s.migrate(path); err != nil {
 			_ = s.log.Close()
@@ -212,10 +226,17 @@ func Open(path string, options Options) (*Store, error) {
 	if options.SyncInterval > 0 {
 		s.startSyncTask()
 	}
-	if options.AutoCompact {
+	if options.AutoCompact && !s.ReadOnly() {
 		s.startCompactionTask()
 	}
 	return s, nil
+}
+
+// ReadOnly reports whether Open put the store in read-only mode because the log
+// sets a read-only feature bit this build does not know. Every write then
+// returns an error wrapping ErrReadOnly that names the feature.
+func (s *Store) ReadOnly() bool {
+	return s.readOnlyReason != nil
 }
 
 // Close shuts down the store gracefully
@@ -326,6 +347,9 @@ func (s *Store) Put(key string, value []byte, options *PutOptions) error {
 	if s.closed.Load() {
 		return ErrStoreClosed
 	}
+	if s.readOnlyReason != nil {
+		return s.readOnlyReason
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -336,7 +360,7 @@ func (s *Store) Put(key string, value []byte, options *PutOptions) error {
 	}
 
 	// Write to log
-	offset, size, recordOffset, storedSize, err := s.log.Append(key, value, false, attributes)
+	offset, size, recordOffset, storedSize, err := s.log.Append(key, value, false, attributes, nil)
 	if err != nil {
 		return fmt.Errorf("failed to append to log: %w", err)
 	}
@@ -423,6 +447,9 @@ func (s *Store) Delete(key string) error {
 	if s.closed.Load() {
 		return ErrStoreClosed
 	}
+	if s.readOnlyReason != nil {
+		return s.readOnlyReason
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -433,7 +460,7 @@ func (s *Store) Delete(key string) error {
 	}
 
 	// Write tombstone to log
-	if _, _, _, _, err := s.log.Append(key, nil, true, nil); err != nil {
+	if _, _, _, _, err := s.log.Append(key, nil, true, nil, nil); err != nil {
 		return fmt.Errorf("failed to write tombstone: %w", err)
 	}
 	// Remove from index and cache
@@ -601,6 +628,15 @@ func (s *Store) migrate(path string) error {
 			return err
 		}
 	}
+	// A version 4 record and a version 5 record with an empty extension area are
+	// the same bytes, so only the header is stale. Rewriting it migrates a log of
+	// any size in one write.
+	if info.FromVersion == 4 {
+		if err := s.log.setVersion(logVersion); err != nil {
+			return fmt.Errorf("migrate log from v4 to v%d: %w", info.ToVersion, err)
+		}
+		return nil
+	}
 	if err := s.Compact(); err != nil {
 		return fmt.Errorf("migrate log from v%d to v%d: %w", info.FromVersion, info.ToVersion, err)
 	}
@@ -655,6 +691,9 @@ func (s *Store) Compact() error {
 	if s.closed.Load() {
 		return ErrStoreClosed
 	}
+	if s.readOnlyReason != nil {
+		return s.readOnlyReason
+	}
 
 	if !s.compacting.CompareAndSwap(false, true) {
 		return ErrCompactionInProgress
@@ -697,10 +736,12 @@ func (s *Store) Compact() error {
 			continue
 		}
 
-		// Read value from old log
-		var value []byte
+		// Read value from old log. An extension entry this build does not know
+		// travels with the value: dropping it would lose data that a build which
+		// does know the tag still needs.
+		var value, extensions []byte
 		if s.log.version >= 4 {
-			value, err = s.log.ReadRecordAt(entry.RecordOffset, entry.StoredSize)
+			value, extensions, err = s.log.ReadRecordAndExtensionsAt(entry.RecordOffset, entry.StoredSize)
 		} else {
 			value, err = s.log.ReadAt(entry.Offset, entry.Size)
 		}
@@ -711,7 +752,7 @@ func (s *Store) Compact() error {
 		}
 
 		// Write to new log
-		offset, size, recordOffset, storedSize, err := newLog.Append(key, value, false, entry.Attributes)
+		offset, size, recordOffset, storedSize, err := newLog.Append(key, value, false, entry.Attributes, extensions)
 		if err != nil {
 			_ = newLog.Close()
 			_ = os.Remove(newLogPath)

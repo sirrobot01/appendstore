@@ -12,21 +12,38 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 )
 
 const (
 	logMagic      = "HYBR"
-	logVersion    = uint32(4)
+	logVersion    = uint32(5)
 	logHeaderSize = 16
+
+	// knownIncompatibleFeatures and knownReadOnlyFeatures are the feature bits
+	// this build understands. Version 5 defines none. A later capability claims
+	// a bit here instead of changing the version: a build that does not know an
+	// incompatible bit refuses the log, and a build that does not know a
+	// read-only bit reads the log but never writes it. See docs/stable-format.md.
+	knownIncompatibleFeatures = uint32(0)
+	knownReadOnlyFeatures     = uint32(0)
 
 	maxKeySize        = 1 << 20
 	maxValueSize      = int64(1<<31 - 1)
 	maxAttributesSize = 16 << 20
 	maxAttributeCount = 4096
 
-	v4FixedBodySize = 16                  // flags/reserved + keyLen + attributesLen + valueLen
-	v4MinimumLength = v4FixedBodySize + 4 // fixed body + checksum
+	// maxExtensionsSize bounds the extension area of one record. The format
+	// allows any size the record length can express; the bound keeps a corrupt
+	// length from turning into a multi-gigabyte allocation during a scan.
+	maxExtensionsSize = 16 << 20
+
+	recordFixedBodySize = 16                      // flags/reserved + keyLen + attributesLen + valueLen
+	recordMinimumLength = recordFixedBodySize + 4 // fixed body + checksum
+	recordFieldsOffset  = 4 + recordFixedBodySize // first byte of the key
+
+	extensionHeaderSize = 6 // tag + length
 
 	// maxRetainedScratch caps reused encode/read buffers so one oversized
 	// record does not pin memory for the life of the store.
@@ -56,7 +73,14 @@ const (
 	legacyAddedOnAttribute   = "added_on"
 )
 
-// Version 4 record layout (all integers are little-endian):
+// Header layout (all integers are little-endian):
+//
+//	byte[4] magic "HYBR"
+//	uint32  version
+//	uint32  incompatible feature mask
+//	uint32  read-only feature mask
+//
+// Version 5 record layout:
 //
 //	uint32 record length (everything after this field)
 //	byte   flags (bit 0 is a tombstone)
@@ -67,11 +91,24 @@ const (
 //	byte[] key
 //	byte[] encoded attributes
 //	byte[] value
-//	uint32 CRC32C of flags through value
+//	byte[] extensions (zero or more entries of uint16 tag, uint32 length, payload)
+//	uint32 CRC32C of flags through the extensions
 //
 // The explicit length makes incomplete-tail recovery unambiguous. The checksum
 // detects corruption in keys, attributes, values, and structural fields.
+//
+// The known fields must fit inside the record length rather than equal it. The
+// remainder is the extension area, which a reader steps over when it does not
+// know a tag. That tolerance is what lets a new writer add a field without
+// breaking an old reader. A version 4 record is a version 5 record with an
+// empty extension area, so the same reader serves both.
 var checksumTable = crc32.MakeTable(crc32.Castagnoli)
+
+// recordBounds locates the variable-length areas of a validated stored record.
+type recordBounds struct {
+	valueStart, valueLen           int64
+	extensionsStart, extensionsLen int64
+}
 
 type logRecord struct {
 	Key          string
@@ -89,9 +126,14 @@ type appendLog struct {
 	path     string
 	writePos int64
 
-	// version is the on-disk log format. Logs older than logVersion are
-	// read-only: Open migrates them to v4 via Compact before serving writes.
+	// version is the on-disk log format. Logs older than logVersion cannot take
+	// an append: Open migrates them before serving writes.
 	version uint32
+
+	// incompatibleFeatures and readOnlyFeatures are the masks from the header.
+	// They are zero for a version 1 to 4 log, which has no masks.
+	incompatibleFeatures uint32
+	readOnlyFeatures     uint32
 
 	// appendBuf is the reusable record encode buffer. Append is serialized by
 	// mu, so no further synchronization is needed.
@@ -139,12 +181,10 @@ func openAppendLogFile(path string) (*appendLog, error) {
 		}
 		log.writePos = logHeaderSize
 	} else {
-		version, err := log.validateHeader()
-		if err != nil {
+		if err := log.readHeader(); err != nil {
 			_ = file.Close()
 			return nil, err
 		}
-		log.version = version
 		log.writePos = info.Size()
 	}
 	log.remap()
@@ -262,35 +302,92 @@ func createAppendLogMode(path string, mode os.FileMode) (*appendLog, error) {
 func (l *appendLog) writeHeader() error {
 	header := make([]byte, logHeaderSize)
 	copy(header[:4], logMagic)
-	binary.LittleEndian.PutUint32(header[4:8], logVersion)
+	binary.LittleEndian.PutUint32(header[4:8], l.version)
+	binary.LittleEndian.PutUint32(header[8:12], l.incompatibleFeatures)
+	binary.LittleEndian.PutUint32(header[12:16], l.readOnlyFeatures)
 	_, err := l.file.WriteAt(header, 0)
 	return err
 }
 
-func (l *appendLog) validateHeader() (uint32, error) {
+// setVersion rewrites the header with a different format version. The record
+// bytes of a version 4 log are already valid version 5 records, so migrating
+// that log costs one header write instead of a full copy. Downgrade uses the
+// same call in the other direction.
+func (l *appendLog) setVersion(version uint32) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	previous := l.version
+	l.version = version
+	if err := l.writeHeader(); err != nil {
+		l.version = previous
+		return err
+	}
+	return l.file.Sync()
+}
+
+// readHeader validates the header and records what the log requires of the
+// reader. It reports ErrUnsupportedFeature when the log needs a capability this
+// build does not have; an unknown read-only bit is left for the caller, which
+// opens the log but must refuse every write.
+func (l *appendLog) readHeader() error {
 	header := make([]byte, logHeaderSize)
 	if _, err := l.file.ReadAt(header, 0); err != nil {
-		return 0, fmt.Errorf("%w: read header: %v", ErrCorruptedData, err)
+		return fmt.Errorf("%w: read header: %v", ErrCorruptedData, err)
 	}
 	if string(header[:4]) != logMagic {
-		return 0, fmt.Errorf("%w: invalid magic", ErrCorruptedData)
+		return fmt.Errorf("%w: invalid magic", ErrCorruptedData)
 	}
 	version := binary.LittleEndian.Uint32(header[4:8])
 	if version == 0 {
-		return 0, fmt.Errorf("%w: invalid log version 0", ErrCorruptedData)
+		return fmt.Errorf("%w: invalid log version 0", ErrCorruptedData)
 	}
 	if version > logVersion {
-		return 0, fmt.Errorf("%w: %d (maximum %d)", ErrUnsupportedVersion, version, logVersion)
+		return fmt.Errorf("%w: %d (maximum %d)", ErrUnsupportedVersion, version, logVersion)
 	}
-	return version, nil
+	l.version = version
+	// Versions 1 to 4 left bytes 8 to 16 zero, so only a version 5 header
+	// carries feature masks. Reading them from an older header would give
+	// meaning to bytes no writer ever set.
+	if version >= 5 {
+		l.incompatibleFeatures = binary.LittleEndian.Uint32(header[8:12])
+		l.readOnlyFeatures = binary.LittleEndian.Uint32(header[12:16])
+	}
+	if unknown := l.incompatibleFeatures &^ knownIncompatibleFeatures; unknown != 0 {
+		return unknownFeatureError("incompatible", unknown)
+	}
+	return nil
 }
 
-// Append writes one v4 record and returns the value and record locations.
-func (l *appendLog) Append(key string, value []byte, deleted bool, attributes map[string]string) (offset int64, size int32, recordOffset int64, storedSize int64, err error) {
+// unknownReadOnly returns the read-only feature bits this build does not know.
+// A log that sets one is readable, but nothing here may write to it.
+func (l *appendLog) unknownReadOnly() uint32 {
+	return l.readOnlyFeatures &^ knownReadOnlyFeatures
+}
+
+// unknownFeatureError names every bit of a mask this build does not know, so a
+// refusal points at the capability that caused it and not at a version number.
+func unknownFeatureError(mask string, unknown uint32) error {
+	bits := make([]string, 0, 32)
+	for bit := range 32 {
+		if unknown&(1<<bit) != 0 {
+			bits = append(bits, strconv.Itoa(bit))
+		}
+	}
+	return fmt.Errorf("%w: %s mask sets bit %s", ErrUnsupportedFeature, mask, strings.Join(bits, ", "))
+}
+
+// Append writes one record and returns the value and record locations. The
+// extensions argument holds already-encoded extension entries, which only
+// compaction supplies: it copies the area verbatim so an entry this build does
+// not know survives the rewrite.
+func (l *appendLog) Append(key string, value []byte, deleted bool, attributes map[string]string, extensions []byte) (offset int64, size int32, recordOffset int64, storedSize int64, err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.version != logVersion {
-		return 0, 0, 0, 0, fmt.Errorf("cannot append v4 record to v%d log", l.version)
+		return 0, 0, 0, 0, fmt.Errorf("cannot append a v%d record to a v%d log", logVersion, l.version)
+	}
+	if unknown := l.unknownReadOnly(); unknown != 0 {
+		return 0, 0, 0, 0, unknownFeatureError("read-only", unknown)
 	}
 	keyBytes := []byte(key)
 	if len(keyBytes) > maxKeySize {
@@ -299,11 +396,17 @@ func (l *appendLog) Append(key string, value []byte, deleted bool, attributes ma
 	if int64(len(value)) > maxValueSize {
 		return 0, 0, 0, 0, fmt.Errorf("%w: value is %d bytes (maximum %d)", ErrValueTooLarge, len(value), maxValueSize)
 	}
+	if len(extensions) > maxExtensionsSize {
+		return 0, 0, 0, 0, fmt.Errorf("%w: extensions are %d bytes (maximum %d)", ErrValueTooLarge, len(extensions), maxExtensionsSize)
+	}
+	if err := validateExtensions(extensions); err != nil {
+		return 0, 0, 0, 0, err
+	}
 	attributesBytes, err := encodeAttributes(attributes)
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
-	recordLength := int64(v4MinimumLength) + int64(len(keyBytes)+len(attributesBytes)+len(value))
+	recordLength := int64(recordMinimumLength) + int64(len(keyBytes)+len(attributesBytes)+len(value)+len(extensions))
 	if recordLength > int64(^uint32(0)) {
 		return 0, 0, 0, 0, fmt.Errorf("%w: encoded record is %d bytes", ErrValueTooLarge, recordLength)
 	}
@@ -335,6 +438,8 @@ func (l *appendLog) Append(key string, value []byte, deleted bool, attributes ma
 	valueOffset := l.writePos + int64(pos)
 	copy(buf[pos:], value)
 	pos += len(value)
+	copy(buf[pos:], extensions)
+	pos += len(extensions)
 	binary.LittleEndian.PutUint32(buf[pos:], crc32.Checksum(buf[4:pos], checksumTable))
 	recordStart := l.writePos
 	if _, err := l.file.WriteAt(buf, recordStart); err != nil {
@@ -475,31 +580,57 @@ func decodeAttributes(buf []byte) (map[string]string, error) {
 var recordScratchPool = sync.Pool{New: func() any { return new([]byte) }}
 
 func checkStoredSize(storedSize int64) error {
-	if storedSize < 4+v4MinimumLength || storedSize > int64(int(^uint(0)>>1)) {
+	if storedSize < 4+recordMinimumLength || storedSize > int64(int(^uint(0)>>1)) {
 		return fmt.Errorf("%w: invalid stored record size %d", ErrCorruptedData, storedSize)
 	}
 	return nil
 }
 
+// validateExtensions walks the extension area and checks that every entry is
+// framed correctly. It does not interpret a tag: an entry this build does not
+// know is stepped over here and copied unchanged by compaction.
+func validateExtensions(extensions []byte) error {
+	for pos := 0; pos < len(extensions); {
+		if len(extensions)-pos < extensionHeaderSize {
+			return fmt.Errorf("extension entry at %d is truncated", pos)
+		}
+		length := int64(binary.LittleEndian.Uint32(extensions[pos+2:]))
+		pos += extensionHeaderSize
+		if length > int64(len(extensions)-pos) {
+			return fmt.Errorf("extension entry at %d claims %d bytes", pos-extensionHeaderSize, length)
+		}
+		pos += int(length)
+	}
+	return nil
+}
+
 // validateStoredRecord checks the framing, checksum, and field lengths of one
-// complete stored record and returns the bounds of its value.
-func validateStoredRecord(record []byte) (valueStart, valueLen int64, err error) {
+// complete stored record and returns the bounds of its variable-length areas.
+// The known fields must fit inside the record length; whatever follows them is
+// the extension area.
+func validateStoredRecord(record []byte) (recordBounds, error) {
+	var bounds recordBounds
 	recordLength := int64(binary.LittleEndian.Uint32(record[:4]))
 	if recordLength+4 != int64(len(record)) {
-		return 0, 0, fmt.Errorf("%w: record length mismatch", ErrCorruptedData)
+		return bounds, fmt.Errorf("%w: record length mismatch", ErrCorruptedData)
 	}
 	wantChecksum := binary.LittleEndian.Uint32(record[len(record)-4:])
 	gotChecksum := crc32.Checksum(record[4:len(record)-4], checksumTable)
 	if gotChecksum != wantChecksum {
-		return 0, 0, fmt.Errorf("%w: checksum mismatch", ErrCorruptedData)
+		return bounds, fmt.Errorf("%w: checksum mismatch", ErrCorruptedData)
 	}
 	keyLen := int64(binary.LittleEndian.Uint32(record[8:12]))
 	attributesLen := int64(binary.LittleEndian.Uint32(record[12:16]))
-	valueLen = int64(binary.LittleEndian.Uint32(record[16:20]))
-	if int64(v4MinimumLength)+keyLen+attributesLen+valueLen != recordLength {
-		return 0, 0, fmt.Errorf("%w: invalid record field lengths", ErrCorruptedData)
+	valueLen := int64(binary.LittleEndian.Uint32(record[16:20]))
+	known := int64(recordMinimumLength) + keyLen + attributesLen + valueLen
+	if known > recordLength {
+		return bounds, fmt.Errorf("%w: invalid record field lengths", ErrCorruptedData)
 	}
-	return 20 + keyLen + attributesLen, valueLen, nil
+	bounds.valueStart = recordFieldsOffset + keyLen + attributesLen
+	bounds.valueLen = valueLen
+	bounds.extensionsStart = bounds.valueStart + valueLen
+	bounds.extensionsLen = recordLength - known
+	return bounds, nil
 }
 
 // ReadAt reads a raw value by its offset and size. It is only used to read
@@ -520,11 +651,11 @@ func (l *appendLog) ReadRecordAt(recordOffset, storedSize int64) ([]byte, error)
 		return nil, err
 	}
 	if record, ok := l.mappedRecord(recordOffset, storedSize); ok {
-		valueStart, valueLen, err := validateStoredRecord(record)
+		bounds, err := validateStoredRecord(record)
 		if err != nil {
 			return nil, err
 		}
-		return bytes.Clone(record[valueStart : valueStart+valueLen]), nil
+		return bytes.Clone(record[bounds.valueStart : bounds.valueStart+bounds.valueLen]), nil
 	}
 	scratchPtr := recordScratchPool.Get().(*[]byte)
 	value, scratch, err := l.readRecordFromFile(recordOffset, storedSize, *scratchPtr)
@@ -546,16 +677,40 @@ func (l *appendLog) ReadRecordAtInto(recordOffset, storedSize int64, scratch []b
 		return nil, scratch, err
 	}
 	if record, ok := l.mappedRecord(recordOffset, storedSize); ok {
-		valueStart, valueLen, err := validateStoredRecord(record)
+		bounds, err := validateStoredRecord(record)
 		if err != nil {
 			return nil, scratch, err
 		}
 		// Copy out of the mapping: callers may scribble on the returned value,
 		// and the read-only mapping must never be written.
-		scratch = append(scratch[:0], record[valueStart:valueStart+valueLen]...)
+		scratch = append(scratch[:0], record[bounds.valueStart:bounds.valueStart+bounds.valueLen]...)
 		return scratch, scratch, nil
 	}
 	return l.readRecordFromFile(recordOffset, storedSize, scratch)
+}
+
+// ReadRecordAndExtensionsAt returns copies of the value and the raw extension
+// area of one stored record. Compaction uses it: an extension entry this build
+// does not know must survive the copy, or a downgrade and a later upgrade lose
+// the data it carries.
+func (l *appendLog) ReadRecordAndExtensionsAt(recordOffset, storedSize int64) ([]byte, []byte, error) {
+	if err := checkStoredSize(storedSize); err != nil {
+		return nil, nil, err
+	}
+	record, ok := l.mappedRecord(recordOffset, storedSize)
+	if !ok {
+		record = make([]byte, storedSize)
+		if _, err := l.file.ReadAt(record, recordOffset); err != nil {
+			return nil, nil, err
+		}
+	}
+	bounds, err := validateStoredRecord(record)
+	if err != nil {
+		return nil, nil, err
+	}
+	value := bytes.Clone(record[bounds.valueStart : bounds.valueStart+bounds.valueLen])
+	extensions := bytes.Clone(record[bounds.extensionsStart : bounds.extensionsStart+bounds.extensionsLen])
+	return value, extensions, nil
 }
 
 func (l *appendLog) readRecordFromFile(recordOffset, storedSize int64, scratch []byte) ([]byte, []byte, error) {
@@ -567,11 +722,11 @@ func (l *appendLog) readRecordFromFile(recordOffset, storedSize int64, scratch [
 	if _, err := l.file.ReadAt(scratch, recordOffset); err != nil {
 		return nil, scratch, err
 	}
-	valueStart, valueLen, err := validateStoredRecord(scratch)
+	bounds, err := validateStoredRecord(scratch)
 	if err != nil {
 		return nil, scratch, err
 	}
-	return scratch[valueStart : valueStart+valueLen], scratch, nil
+	return scratch[bounds.valueStart : bounds.valueStart+bounds.valueLen], scratch, nil
 }
 
 func (l *appendLog) Iterate(fn func(*logRecord) error) error {
@@ -586,20 +741,27 @@ func (l *appendLog) Iterate(fn func(*logRecord) error) error {
 	var fixed [16]byte
 	var stringScratch []byte
 	var attributesScratch []byte
+	var extensionsScratch []byte
 	valueCopyScratch := make([]byte, 32<<10)
 	for pos < fileSize {
 		var record *logRecord
 		var nextPos int64
 		var err error
 		if l.version >= 4 {
-			record, nextPos, err = readV4RecordFrom(r, pos, fixed[:], &stringScratch, &attributesScratch, valueCopyScratch)
+			record, nextPos, err = readRecordFrom(r, pos, fixed[:], &stringScratch, &attributesScratch, &extensionsScratch, valueCopyScratch)
 		} else {
 			record, nextPos, err = readLegacyRecordFrom(r, pos, l.version, fixed[:8], &stringScratch)
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				if truncateErr := l.file.Truncate(pos); truncateErr != nil {
-					return errors.Join(err, fmt.Errorf("truncate incomplete record: %w", truncateErr))
+				// Discarding the incomplete record repairs the log, and a repair
+				// is a write. A log that needs a feature this build does not know
+				// keeps its bytes: stop at the torn record and serve what came
+				// before it.
+				if l.unknownReadOnly() == 0 {
+					if truncateErr := l.file.Truncate(pos); truncateErr != nil {
+						return errors.Join(err, fmt.Errorf("truncate incomplete record: %w", truncateErr))
+					}
 				}
 				l.writePos = pos
 				return nil
@@ -617,22 +779,24 @@ func (l *appendLog) Iterate(fn func(*logRecord) error) error {
 	return nil
 }
 
-func readV4RecordFrom(r *bufio.Reader, startPos int64, fixed []byte, keyScratch, attributesScratch *[]byte, copyScratch []byte) (*logRecord, int64, error) {
+// readRecordFrom reads one version 4 or version 5 record. The two differ only
+// in whether the extension area may be non-empty, so one reader serves both.
+func readRecordFrom(r *bufio.Reader, startPos int64, fixed []byte, keyScratch, attributesScratch, extensionsScratch *[]byte, copyScratch []byte) (*logRecord, int64, error) {
 	pos := startPos
 	if _, err := io.ReadFull(r, fixed[:4]); err != nil {
 		return nil, 0, err
 	}
 	pos += 4
 	recordLength := binary.LittleEndian.Uint32(fixed[:4])
-	if recordLength < v4MinimumLength {
+	if recordLength < recordMinimumLength {
 		return nil, 0, fmt.Errorf("invalid record length %d", recordLength)
 	}
-	if _, err := io.ReadFull(r, fixed[:v4FixedBodySize]); err != nil {
+	if _, err := io.ReadFull(r, fixed[:recordFixedBodySize]); err != nil {
 		return nil, 0, err
 	}
-	pos += v4FixedBodySize
+	pos += recordFixedBodySize
 	hash := crc32.New(checksumTable)
-	_, _ = hash.Write(fixed[:v4FixedBodySize])
+	_, _ = hash.Write(fixed[:recordFixedBodySize])
 	flags := fixed[0]
 	keyLen := binary.LittleEndian.Uint32(fixed[4:8])
 	attributesLen := binary.LittleEndian.Uint32(fixed[8:12])
@@ -640,9 +804,15 @@ func readV4RecordFrom(r *bufio.Reader, startPos int64, fixed []byte, keyScratch,
 	if keyLen > maxKeySize || attributesLen > maxAttributesSize || int64(valueLen) > maxValueSize {
 		return nil, 0, fmt.Errorf("record field exceeds configured limit")
 	}
-	expectedLength := uint64(v4MinimumLength) + uint64(keyLen) + uint64(attributesLen) + uint64(valueLen)
-	if uint64(recordLength) != expectedLength {
-		return nil, 0, fmt.Errorf("record length %d does not match fields", recordLength)
+	// The known fields must fit inside the record, not fill it. The remainder is
+	// the extension area, which this reader steps over.
+	knownLength := uint64(recordMinimumLength) + uint64(keyLen) + uint64(attributesLen) + uint64(valueLen)
+	if knownLength > uint64(recordLength) {
+		return nil, 0, fmt.Errorf("record length %d is smaller than its fields", recordLength)
+	}
+	extensionsLen := uint64(recordLength) - knownLength
+	if extensionsLen > maxExtensionsSize {
+		return nil, 0, fmt.Errorf("extension area is %d bytes (maximum %d)", extensionsLen, maxExtensionsSize)
 	}
 	keyBytes := resizeScratch(keyScratch, int(keyLen))
 	if _, err := io.ReadFull(r, keyBytes); err != nil {
@@ -665,6 +835,12 @@ func readV4RecordFrom(r *bufio.Reader, startPos int64, fixed []byte, keyScratch,
 		return nil, 0, io.ErrUnexpectedEOF
 	}
 	pos += int64(valueLen)
+	extensionBytes := resizeScratch(extensionsScratch, int(extensionsLen))
+	if _, err := io.ReadFull(r, extensionBytes); err != nil {
+		return nil, 0, err
+	}
+	_, _ = hash.Write(extensionBytes)
+	pos += int64(extensionsLen)
 	if _, err := io.ReadFull(r, fixed[:4]); err != nil {
 		return nil, 0, err
 	}
@@ -672,6 +848,11 @@ func readV4RecordFrom(r *bufio.Reader, startPos int64, fixed []byte, keyScratch,
 	wantChecksum := binary.LittleEndian.Uint32(fixed[:4])
 	if hash.Sum32() != wantChecksum {
 		return nil, 0, fmt.Errorf("checksum mismatch")
+	}
+	// Framing is checked after the checksum so that a damaged record is
+	// reported as corruption rather than as a malformed extension.
+	if err := validateExtensions(extensionBytes); err != nil {
+		return nil, 0, err
 	}
 	attributes, err := decodeAttributes(attributesBytes)
 	if err != nil {

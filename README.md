@@ -78,10 +78,32 @@ replacement before atomically installing it. Compaction blocks all reads and
 writes until the replacement is installed; the pause grows with the size of
 the live data.
 
-New records are always written in the version 4 format. `Open` reads legacy
-version 1–3 logs and migrates them to version 4 in one atomic compaction
-before it returns. `Open` returns `ErrUnsupportedVersion` for logs newer than
-version 4.
+## Log format
+
+New records are always written in the version 5 format. Version 5 is designed
+to be the last format change that breaks compatibility. `docs/stable-format.md`
+specifies it in full.
+
+Two mechanisms replace the version number for later changes:
+
+- **Feature bits.** The header holds an incompatible mask and a read-only mask.
+  `Open` returns `ErrUnsupportedFeature` for an unknown incompatible bit, and
+  names the bit. For an unknown read-only bit, `Open` succeeds, `ReadOnly()`
+  reports `true`, and every write returns an error that wraps `ErrReadOnly`.
+- **Record extensions.** Each record ends with an extension area of tagged
+  entries. A reader steps over a tag it does not know, and compaction copies the
+  entry unchanged. A later release can therefore add a per-record field that an
+  older reader ignores, without a feature bit and without a new version. The
+  reader and compaction sides are in place. There is no public API to write an
+  extension yet, so the area is empty in every record this release writes.
+
+`Open` still reads legacy version 1–4 logs and migrates them:
+
+- A version 4 log needs only a new header, because its records are already
+  valid version 5 records.
+- A version 1–3 log is rewritten in one atomic compaction.
+
+`Open` returns `ErrUnsupportedVersion` for a log newer than version 5.
 
 ## Format migration
 
@@ -117,6 +139,34 @@ To roll back, stop the application and restore each backup over its store:
 ```bash
 mv store.db.v3.bak store.db
 ```
+
+A backup only returns the data that existed when the store was migrated. To
+roll back a store that has been written since, use the downgrade tool. It writes
+a version 3 or version 4 log from the live contents of a version 5 log:
+
+```bash
+go run ./cmd/appendstore-downgrade -to 4 store.db store-v4.db
+```
+
+The tool refuses to write anything when a record holds data the target format
+cannot express. A version 4 target cannot express a record extension. A version
+3 target also cannot express an attribute outside its fixed set of named
+fields.
+
+The tool refuses a destination that already exists. Pass `-f` to replace one;
+the output is renamed into place only after every record is written, so a failed
+run leaves the old file untouched.
+
+The tool reads the source log. It writes to the source only to discard an
+incomplete trailing record from an interrupted write, which is the same repair
+that `Open` performs.
+
+A version 4 log holds the same attribute map as version 5, so that target is
+lossless. A version 3 log holds a fixed field per attribute instead, so a value
+that was absent comes back as an empty field when the log is read again.
+
+The downgrade tool exists for the transition to version 5. It is removed
+together with the version 1–4 migration path.
 
 ## Limits
 
